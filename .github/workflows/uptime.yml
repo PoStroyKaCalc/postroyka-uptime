@@ -1,0 +1,96 @@
+# Внешняя проверка доступности ПоСтройКи.
+#
+# Живёт вне Yandex Cloud намеренно: 27.09.2026 облако остановило сервер и CDN
+# за неоплату, а собственные оповещения сервера замолчали вместе с ним.
+# Отсюда видно и «сервер выключен», и «CDN отдаёт чужой сертификат» —
+# curl проверяет, что сертификат выписан именно на наш домен.
+name: uptime
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Проверить сайт и API
+        id: probe
+        run: |
+          set -u
+          fail=""
+          check() {
+            name="$1"; url="$2"; expect="$3"
+            body=$(curl -sS --max-time 20 --retry 2 --retry-delay 5 -w '\n%{http_code}' "$url" 2>&1) || { fail="$fail\n• $name: $(echo "$body" | tail -1)"; return; }
+            code=$(echo "$body" | tail -1)
+            if [ "$code" != "200" ]; then fail="$fail\n• $name: HTTP $code"; return; fi
+            if [ -n "$expect" ] && ! echo "$body" | grep -q "$expect"; then fail="$fail\n• $name: нет «$expect» в ответе"; fi
+          }
+          check "Сайт" "https://postroyka.pro/" "ПоСтройКа"
+          check "Сайт www" "https://www.postroyka.pro/" ""
+          check "Манифест версии" "https://postroyka.pro/app-version.json" "latestVersionCode"
+          check "API /health" "https://api.postroyka.pro/health" ""
+          check "API /ready" "https://api.postroyka.pro/ready" ""
+          if [ -n "$fail" ]; then
+            echo "status=down" >> "$GITHUB_OUTPUT"
+            { echo "details<<EOF"; printf '%b\n' "$fail"; echo "EOF"; } >> "$GITHUB_OUTPUT"
+          else
+            echo "status=up" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Узнать итог прошлого запуска
+        id: prev
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          prev=$(gh run list -R "$GITHUB_REPOSITORY" --workflow uptime.yml --status completed --limit 1 --json conclusion -q '.[0].conclusion' 2>/dev/null || echo "")
+          echo "conclusion=${prev:-success}" >> "$GITHUB_OUTPUT"
+
+      # Сообщаем только о смене состояния: «упало» один раз и «починилось»
+      # один раз, а не каждые 10 минут, пока идёт сбой.
+      - name: Сообщить о сбое
+        if: steps.probe.outputs.status == 'down' && steps.prev.outputs.conclusion != 'failure'
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_ALERT_CHAT_ID }}
+          DETAILS: ${{ steps.probe.outputs.details }}
+        run: |
+          text=$(printf '🔴 ПоСтройКа недоступна (внешняя проверка)\n%s\n\nЧастая причина — блокировка Yandex Cloud за неоплату: проверьте баланс, ВМ и CDN.' "$DETAILS")
+          curl -sS --max-time 20 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=${text}" > /dev/null
+
+      - name: Сообщить о восстановлении
+        if: steps.probe.outputs.status == 'up' && steps.prev.outputs.conclusion == 'failure'
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_ALERT_CHAT_ID }}
+        run: |
+          curl -sS --max-time 20 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+            --data-urlencode "chat_id=${TG_CHAT}" --data-urlencode "text=🟢 ПоСтройКа снова доступна (внешняя проверка)" > /dev/null
+
+      # GitHub отключает расписание в репозитории без активности 60 дней.
+      # Раз в месяц — одна служебная запись, чтобы проверка не остановилась молча.
+      - name: Поддержать расписание активным
+        if: github.event_name == 'schedule' && steps.probe.outputs.status == 'up'
+        run: |
+          if [ "$(date -u +%d%H)" = "0100" ] && [ "$(date -u +%M)" -lt 10 ]; then
+            git clone -q "https://x-access-token:${{ github.token }}@github.com/${GITHUB_REPOSITORY}.git" repo
+            cd repo && date -u +%FT%TZ > KEEPALIVE && git add KEEPALIVE
+            git -c user.name=uptime-bot -c user.email=uptime-bot@users.noreply.github.com commit -qm "keepalive" && git push -q
+          fi
+
+      - name: Отметить запуск как сбойный
+        if: steps.probe.outputs.status == 'down'
+        run: |
+          printf '%b\n' "${{ steps.probe.outputs.details }}"
+          exit 1
